@@ -23,7 +23,8 @@ def ensure_crapper():
         if not (sibling / "crapper").is_dir():
             raise ImportError(
                 "crapper is not installed and was not found at "
-                f"{sibling}. Clone github.com/unclebob/crapper next to mutator."
+                f"{sibling}. Clone https://github.com/ericeil/crapper next to "
+                "mutator. Kotlin mutation sites use that checkout's function names."
             ) from None
         sys.path.insert(0, str(sibling))
         import crapper

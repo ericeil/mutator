@@ -1,15 +1,20 @@
 """Find mutation sites.
 
 Clojure follows clj-mutate's symbol rules. Go follows mutate4go, including
-one-way `*` to `/`. Java follows mutate4java. TypeScript, Rust, and Python
-use the same decisions as Java, spelled in that language. TypeScript also
-mutates `??` to `||` and `?.` to `.` (removed on a call or index). JavaScript
-files use the TypeScript rules.
+one-way `*` to `/`. Java follows mutate4java. TypeScript, Rust, Python, and
+Kotlin use the same decisions as Java, spelled in that language. TypeScript
+also mutates `??` to `||` and `?.` to `.` (removed on a call or index).
+JavaScript files use the TypeScript rules. Kotlin also mutates referential
+equality, safe calls, elvis, not-null assertions, `in`/`is`, ranges, and
+`++`/`--`.
 """
 
 from __future__ import annotations
 
+import sys
+
 from mutator.crapper_link import ensure_crapper
+from mutator.kotlin_source import has_parse_error, prepare_kotlin
 
 _BINARY = {
     "+": "-",
@@ -39,6 +44,18 @@ _BINARY_PARENTS = {
 }
 
 _UNARY_PARENTS = {"unary_expression", "unary_operator", "not_operator"}
+
+# Kotlin spells a binary operator as a child of one of these nodes, not of
+# `binary_expression`. `<` inside `List<Int>` has parent `type_arguments` and
+# is not in this set.
+_KOTLIN_BINARY_PARENTS = _BINARY_PARENTS | {
+    "additive_expression",
+    "comparison_expression",
+    "conjunction_expression",
+    "disjunction_expression",
+    "equality_expression",
+    "multiplicative_expression",
+}
 
 _BOOLEANS = {"true": "false", "false": "true", "True": "False", "False": "True"}
 
@@ -132,6 +149,18 @@ def _category(token: str) -> str:
     if token in {"&&", "||", "??", "and", "or"}:
         return "logical"
     return "arithmetic"
+
+
+def _binary_parents(language: str) -> set[str]:
+    if language == "kotlin":
+        return _KOTLIN_BINARY_PARENTS
+    return _BINARY_PARENTS
+
+
+def _unary_parents(language: str) -> set[str]:
+    if language == "kotlin":
+        return _UNARY_PARENTS | {"prefix_expression"}
+    return _UNARY_PARENTS
 
 
 def _binary_mutant(language: str, token: str) -> str | None:
@@ -280,7 +309,7 @@ def _parent_type(node) -> str:
 
 
 def _visit_binary(node, token: str, parent: str, language: str, found: list[RawSite]) -> None:
-    if parent not in _BINARY_PARENTS:
+    if parent not in _binary_parents(language):
         return
     mutant = _binary_mutant(language, token)
     if mutant is not None:
@@ -295,14 +324,110 @@ def _visit_optional(node, token: str, language: str, found: list[RawSite]) -> No
         _add(found, node, "?.", optional, "optional")
 
 
-def _visit_not(node, token: str, parent: str, found: list[RawSite]) -> None:
-    if token in {"!", "not"} and parent in _UNARY_PARENTS | {"comparison_operator"}:
+def _visit_not(node, token: str, parent: str, language: str, found: list[RawSite]) -> None:
+    if token in {"!", "not"} and parent in _unary_parents(language) | {"comparison_operator"}:
         _add(found, node, token, "", "unary")
 
 
-def _visit_negation(node, token: str, parent: str, found: list[RawSite]) -> None:
-    if token == "-" and parent in _UNARY_PARENTS:
+def _visit_negation(node, token: str, parent: str, language: str, found: list[RawSite]) -> None:
+    if token == "-" and parent in _unary_parents(language):
         _add(found, node, token, "", "unary")
+
+
+def _kotlin_check(node, token: str, found: list[RawSite]) -> None:
+    """Flip `in`/`!in` and `is`/`!is`. A `for` loop's `in` is not a check."""
+
+    parent = node.parent
+    if parent is None or parent.type != "check_expression":
+        return
+    if token == "!":
+        _add(found, node, "!", "", "check")
+        return
+    if token not in {"in", "is"}:
+        return
+    for child in parent.children:
+        if child.id == node.id:
+            break
+        if child.type == "!":
+            return
+    _add(found, node, token, "!" + token, "check")
+
+
+def _kotlin_safe_call(node, token: str, found: list[RawSite]) -> None:
+    """`a?.b` becomes `a.b`. The call stays; only the safe-call dot changes."""
+
+    if token != "?.":
+        return
+    parent = node.parent
+    if parent is None or parent.type != "navigation_suffix":
+        return
+    _add(found, node, "?.", ".", "optional")
+
+
+def _kotlin_assert(node, token: str, found: list[RawSite]) -> None:
+    if token != "!!" or _parent_type(node) != "postfix_expression":
+        return
+    _add(found, node, "!!", "", "assertion")
+
+
+def _kotlin_increment(node, token: str, found: list[RawSite]) -> None:
+    if token not in {"++", "--"}:
+        return
+    if _parent_type(node) not in {"prefix_expression", "postfix_expression"}:
+        return
+    mutant = "--" if token == "++" else "++"
+    _add(found, node, token, mutant, "arithmetic")
+
+
+def _kotlin_range(node, token: str, found: list[RawSite]) -> None:
+    parent = _parent_type(node)
+    if parent == "range_expression" and token in {"..", "..<"}:
+        mutant = "..<" if token == ".." else ".."
+        _add(found, node, token, mutant, "range")
+        return
+    if parent == "infix_expression" and token == "until":
+        _add(found, node, "until", "..", "range")
+
+
+def _elvis_parts(parent, operator) -> tuple | None:
+    parts = [
+        child
+        for child in parent.children
+        if child.type not in {"line_comment", "multiline_comment"}
+    ]
+    if len(parts) != 3 or parts[1].id != operator.id:
+        return None
+    return parts[0], parts[2]
+
+
+def _kotlin_elvis(node, data: bytes, token: str, found: list[RawSite]) -> None:
+    """`a ?: b` can take the default, or refuse null with `!!`.
+
+    Both still compile when `a` is nullable and `b` has the expected type.
+    Replacing the two-character operator alone cannot.
+    """
+
+    if token != "?:":
+        return
+    parent = node.parent
+    if parent is None or parent.type != "elvis_expression":
+        return
+    parts = _elvis_parts(parent, node)
+    if parts is None:
+        return
+    left, right = parts
+    whole = _text(data, parent)
+    _add(found, parent, whole, _text(data, right), "elvis")
+    _add(found, parent, whole, f"({_text(data, left)})!!", "elvis")
+
+
+def _visit_kotlin(node, data: bytes, token: str, found: list[RawSite]) -> None:
+    _kotlin_check(node, token, found)
+    _kotlin_safe_call(node, token, found)
+    _kotlin_assert(node, token, found)
+    _kotlin_increment(node, token, found)
+    _kotlin_range(node, token, found)
+    _kotlin_elvis(node, data, token, found)
 
 
 def _visit_boolean_token(node, token: str, found: list[RawSite]) -> None:
@@ -330,10 +455,12 @@ def _visit_leaf(node, data: bytes, language: str, found: list[RawSite]) -> None:
     parent = _parent_type(node)
     _visit_binary(node, token, parent, language, found)
     _visit_optional(node, token, language, found)
-    _visit_not(node, token, parent, found)
-    _visit_negation(node, token, parent, found)
+    _visit_not(node, token, parent, language, found)
+    _visit_negation(node, token, parent, language, found)
     _visit_boolean_token(node, token, found)
     _visit_constant(node, token, found)
+    if language == "kotlin":
+        _visit_kotlin(node, data, token, found)
 
 
 def _visit_node(node, data: bytes, language: str, found: list[RawSite]) -> None:
@@ -354,19 +481,57 @@ def _visit(node, data: bytes, language: str, found: list[RawSite]) -> None:
         stack.extend(reversed(current.children))
 
 
+def _realign(original: str, site: RawSite) -> RawSite | None:
+    """Keep a site whose text is still at that offset in the original file.
+
+    The while-comparison repair slides one `<` a byte to the left and wraps
+    the member name. The token moves back before the mutant is applied.
+    Anything else the repairs rewrote is not a site.
+    """
+
+    data = original.encode("utf-8")
+    token = site.original.encode("utf-8")
+    if data[site.start : site.end] == token:
+        return site
+    shifted = site.start + 1
+    if (
+        token == b"<"
+        and site.end == site.start + 1
+        and shifted + 1 <= len(data)
+        and data[site.start : shifted] == b" "
+        and data[shifted : shifted + 1] == b"<"
+    ):
+        site.start = shifted
+        site.end = shifted + 1
+        return site
+    return None
+
+
+def _prepare(source: str, language: str, path: str) -> tuple[str, object]:
+    crapper = ensure_crapper()
+    text = prepare_kotlin(source) if language == "kotlin" else source
+    _data, tree = crapper.languages.treesitter.parse(text, _grammar(language, path))
+    if language == "kotlin" and has_parse_error(tree):
+        print(
+            f"{path}: Kotlin parse error; mutation sites in this file may be wrong.",
+            file=sys.stderr,
+        )
+    return text, tree
+
+
 def discover_raw(source: str, language: str, path: str) -> list[RawSite]:
     """Mutation sites in source order. Offsets are UTF-8 byte offsets."""
 
-    crapper = ensure_crapper()
-    data = source.encode("utf-8")
-    grammar = _grammar(language, path)
-    _data, tree = crapper.languages.treesitter.parse(source, grammar)
+    text, tree = _prepare(source, language, path)
+    data = text.encode("utf-8")
     found: list[RawSite] = []
     if language == "clojure":
         _visit_clojure(tree.root_node, data, found)
     else:
         _visit(tree.root_node, data, language, found)
-    found.sort(key=lambda site: (site.line, site.start, site.end))
+    if language == "kotlin":
+        found = [site for site in (_realign(source, site) for site in found) if site is not None]
+    found.sort(key=lambda site: (site.line, site.start, site.end, site.mutant))
     return found
 
 

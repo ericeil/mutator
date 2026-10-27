@@ -197,9 +197,78 @@ def _clojure_plan(root: Path, source: Path) -> tuple[Command, Path]:
     return _clojure_command(directory), directory
 
 
-def _java_plan(root: Path, source: Path) -> tuple[Command, Path]:
+def _java_plan(
+    root: Path, source: Path, maven_args: tuple[str, ...] | list[str] = ()
+) -> tuple[Command, Path]:
     directory = _nearest_marker(source, root, ("pom.xml",))
-    return ["mvn", "-q", "test", "-DexcludeTags=no-mutate"], directory
+    return ["mvn", "-q", "test", "-DexcludeTags=no-mutate", *maven_args], directory
+
+
+_GRADLE_BUILD_FILES = ("build.gradle", "build.gradle.kts")
+
+
+def nearest_any(start: Path, markers: tuple[str, ...], stop: Path) -> Path | None:
+    """The nearest directory at or above `start` that contains one of `markers`."""
+
+    current = start if start.is_dir() else start.parent
+    stop = stop.resolve()
+    current = current.resolve()
+    while True:
+        if any((current / marker).is_file() for marker in markers):
+            return current
+        if current == stop or current.parent == current:
+            return None
+        current = current.parent
+
+
+def _gradle_program(module: Path, root: Path) -> str:
+    """A wrapper path relative to `module`, so a worker runs its own copy.
+
+    An absolute path would point at the real tree. Gradle then resolves the
+    script's directory and compiles the unmutated sources. `gradlew` is copied
+    into the worker, and this relative path finds that copy.
+    """
+
+    wrapper = nearest(module, "gradlew", root)
+    if wrapper is None:
+        return "gradle"
+    relative = Path(os.path.relpath(wrapper / "gradlew", module)).as_posix()
+    # `gradlew` with no slash is looked up on PATH. The wrapper in this
+    # directory has to be `./gradlew` so the worker's copy is the one that runs.
+    if "/" not in relative:
+        return "./" + relative
+    return relative
+
+
+def _kotlin_tool(root: Path, source: Path) -> tuple[str, Path]:
+    """Gradle when its build file is strictly nearer than pom.xml.
+
+    A directory that has both is a Maven module, matching crapper.
+    """
+
+    gradle = nearest_any(source, _GRADLE_BUILD_FILES, root)
+    maven = nearest(source, "pom.xml", root)
+    if gradle is not None and (maven is None or len(gradle.parts) > len(maven.parts)):
+        return "gradle", gradle
+    if maven is not None:
+        return "maven", maven
+    if gradle is not None:
+        return "gradle", gradle
+    return "gradle", root
+
+
+def _kotlin_plan(
+    root: Path,
+    source: Path,
+    gradle_args: tuple[str, ...] | list[str] = (),
+    maven_args: tuple[str, ...] | list[str] = (),
+) -> tuple[Command, Path]:
+    tool, directory = _kotlin_tool(root, source)
+    if tool == "maven":
+        return ["mvn", "-q", "test", "-DexcludeTags=no-mutate", *maven_args], directory
+    # Args sit after `test`, so `--tests` is a task option. `-D` and `-P`
+    # apply from either position.
+    return [_gradle_program(directory, root), "test", *gradle_args], directory
 
 
 def _go_plan(root: Path, source: Path) -> tuple[Command, Path]:
@@ -224,7 +293,6 @@ def _python_plan(root: Path, source: Path) -> tuple[Command, Path]:
 
 _PLANS = {
     "clojure": _clojure_plan,
-    "java": _java_plan,
     "go": _go_plan,
     "typescript": _typescript_plan,
     "rust": _rust_plan,
@@ -232,16 +300,29 @@ _PLANS = {
 }
 
 
-def test_plan(root: Path, source: Path, language: str, override: str | None) -> tuple[Command, Path]:
+def test_plan(
+    root: Path,
+    source: Path,
+    language: str,
+    override: str | None,
+    gradle_args: tuple[str, ...] | list[str] = (),
+    maven_args: tuple[str, ...] | list[str] = (),
+) -> tuple[Command, Path]:
     """The test command and the directory it runs in.
 
     A user override stays a shell string. Every generated command is an
-    argument vector, so a package path is one argument.
+    argument vector, so a package path is one argument. Gradle and Maven
+    arguments are added for Kotlin, and Maven arguments for Java. They are
+    not added to an override.
     """
 
     root = root.resolve()
     if override:
         return override, root
+    if language == "kotlin":
+        return _kotlin_plan(root, source, gradle_args, maven_args)
+    if language == "java":
+        return _java_plan(root, source, maven_args)
     plan = _PLANS.get(language)
     if plan is None:
         return ["false"], root

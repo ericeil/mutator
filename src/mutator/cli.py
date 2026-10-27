@@ -54,10 +54,10 @@ def _skipped_directory_text() -> str:
 HELP = f"""\
 Usage: mutator [options] [path-or-filter ...]
 
-Discover mutation sites in Clojure, Java, Go, TypeScript, Rust, and Python,
-run the project's tests against each one, and write `.metrics/mutate` for
-uml-viewer. Namespaces and function names are the ones crapper writes into
-`.metrics/crap.edn`.
+Discover mutation sites in Clojure, Java, Kotlin, Go, TypeScript, Rust, and
+Python, run the project's tests against each one, and write `.metrics/mutate`
+for uml-viewer. Namespaces and function names are the ones crapper writes into
+`.metrics/crap.edn`. Kotlin needs a crapper checkout that scores Kotlin.
 
 A form id is `defn/<name>` or, for a private operation, `defn-/<name>`.
 uml-viewer joins that name to the operation and joins `:namespace` to the
@@ -88,6 +88,15 @@ Options:
   --test-command <cmd>          Run this command for the baseline and every
                                 mutant. The working directory is the project
                                 root.
+  --gradle-arg <arg>            Extra argument for a Kotlin Gradle test run,
+                                and for the Gradle JaCoCo coverage run. Repeat
+                                for more than one. A value may start with '-',
+                                as in --gradle-arg=--tests or
+                                --gradle-arg=-DJacoco. Placed after `test`, so
+                                `--tests` reaches the test task.
+  --maven-arg <arg>             Extra argument for a Java or Kotlin Maven test
+                                run, and for the Maven JaCoCo coverage run.
+                                Repeat for more than one.
   --timeout-factor <number>     Mutant timeout, as a multiple of the baseline
                                 duration. Default: 10. The timeout is at least
                                 2 seconds.
@@ -124,7 +133,10 @@ Exit codes:
 
 Coverage, when it is produced, uses the same commands as crapper:
   Clojure      clj -M:cov --lcov
-  Java         Maven JaCoCo
+  Java/Kotlin  Maven or Gradle JaCoCo. Extra arguments come from crapper.toml
+               (gradle-args, maven-args) and then from --gradle-arg and
+               --maven-arg. They are not added to --coverage-command or
+               --test-command.
   Go           go test ./... -coverprofile=...
   TypeScript   npm run coverage, Vitest, or c8
   Rust         cargo llvm-cov or cargo tarpaulin
@@ -150,6 +162,8 @@ class Options:
     use_existing_coverage: bool = False
     coverage_command: str | None = None
     test_command: str | None = None
+    gradle_args: list[str] = field(default_factory=list)
+    maven_args: list[str] = field(default_factory=list)
     timeout_factor: float = 10.0
     mutation_warning: int = 50
     max_workers: int | None = None
@@ -161,6 +175,24 @@ def _take(args: list[str], index: int, option: str) -> str:
     if index + 1 >= len(args) or not args[index + 1] or args[index + 1].startswith("-"):
         raise ValueError(f"{option} requires a value")
     return args[index + 1]
+
+
+def _option_value(args: list[str], index: int, option: str) -> tuple[str, int]:
+    """The value of `option`, either `--option=value` or the next argument.
+
+    The next argument may itself start with `-`, so `--gradle-arg -DJacoco`
+    and `--gradle-arg=--tests` both work.
+    """
+
+    prefix = option + "="
+    if args[index].startswith(prefix):
+        value = args[index][len(prefix) :]
+        if not value:
+            raise ValueError(f"{option} requires a value")
+        return value, index + 1
+    if index + 1 >= len(args) or args[index + 1] == "":
+        raise ValueError(f"{option} requires a value")
+    return args[index + 1], index + 2
 
 
 def _workers(value: str) -> int:
@@ -212,6 +244,14 @@ def parse_args(argv: list[str] | None = None) -> Options:
             if arg == "--test-command":
                 options.test_command = _take(args, index, arg)
                 index += 2
+                continue
+            if arg == "--gradle-arg" or arg.startswith("--gradle-arg="):
+                value, index = _option_value(args, index, "--gradle-arg")
+                options.gradle_args.append(value)
+                continue
+            if arg == "--maven-arg" or arg.startswith("--maven-arg="):
+                value, index = _option_value(args, index, "--maven-arg")
+                options.maven_args.append(value)
                 continue
             if arg == "--timeout-factor":
                 options.timeout_factor = float(_take(args, index, arg))
@@ -430,7 +470,57 @@ def select_files(options: Options) -> list[Path]:
     return sorted(set(_inside_root(_matching(files, filters), root)), key=lambda item: item.as_posix())
 
 
-def _prepare_coverage(options: Options, root: Path, files: list[Path]) -> int:
+def _warn_unused_build_args(options: Options, gradle: list[str], maven: list[str]) -> None:
+    if not gradle and not maven:
+        return
+    if options.test_command and not options.scan:
+        print(
+            "--gradle-arg and --maven-arg are not added to --test-command.",
+            file=sys.stderr,
+        )
+    if options.coverage_command and not options.scan and not options.no_coverage:
+        print(
+            "--gradle-arg and --maven-arg are not added to --coverage-command.",
+            file=sys.stderr,
+        )
+
+
+def _combine_build_args(
+    options: Options, configured_gradle: list[str], configured_maven: list[str]
+) -> tuple[list[str], list[str]]:
+    gradle = [*configured_gradle, *options.gradle_args]
+    maven = [*configured_maven, *options.maven_args]
+    _warn_unused_build_args(options, gradle, maven)
+    return gradle, maven
+
+
+def _build_args(options: Options, root: Path) -> tuple[list[str], list[str], str | None]:
+    """Command-line build args, after the ones in crapper.toml.
+
+    The third value is an error message when crapper.toml cannot be read.
+    A crapper checkout without that module contributes no file arguments.
+    """
+
+    try:
+        from crapper.config import ConfigError, build_tool_args
+    except ImportError:
+        gradle, maven = _combine_build_args(options, [], [])
+        return gradle, maven, None
+    try:
+        configured_gradle, configured_maven = build_tool_args(root)
+    except ConfigError as exc:
+        return [], [], str(exc)
+    gradle, maven = _combine_build_args(options, configured_gradle, configured_maven)
+    return gradle, maven, None
+
+
+def _prepare_coverage(
+    options: Options,
+    root: Path,
+    files: list[Path],
+    gradle_args: list[str] | None = None,
+    maven_args: list[str] | None = None,
+) -> int:
     """Run coverage generation. A failed command's code is returned as-is.
 
     Reports already on disk are left unread when the command fails, so a stale
@@ -452,7 +542,13 @@ def _prepare_coverage(options: Options, root: Path, files: list[Path]) -> int:
             return result.code
         return 0
     crapper = ensure_crapper()
-    code = crapper.runners.run_coverage(root, files, None)
+    code = crapper.runners.run_coverage(
+        root,
+        files,
+        None,
+        gradle_args=gradle_args or [],
+        maven_args=maven_args or [],
+    )
     if isinstance(code, int) and code != 0:
         return code
     return 0
@@ -526,7 +622,13 @@ def _finish(baseline_failed: bool, survived: bool) -> int:
     return 0
 
 
-def _mutate_files(options: Options, root: Path, files: list[Path]) -> int:
+def _mutate_files(
+    options: Options,
+    root: Path,
+    files: list[Path],
+    gradle_args: list[str],
+    maven_args: list[str],
+) -> int:
     runner = CommandRunner(verbose=options.verbose)
     baselines: dict[tuple[tuple[str, ...], str], tuple[bool, float, str]] = {}
     forms = []
@@ -547,6 +649,8 @@ def _mutate_files(options: Options, root: Path, files: list[Path]) -> int:
             mutation_warning=options.mutation_warning,
             baselines=baselines,
             max_workers=options.max_workers,
+            gradle_args=gradle_args,
+            maven_args=maven_args,
         )
         outcome = _record(result, forms, written)
         if outcome == "baseline":
@@ -569,6 +673,10 @@ def run(argv: list[str] | None = None) -> int:
         print(missing, file=sys.stderr)
         return 2
     root = options.project_root.resolve()
+    gradle_args, maven_args, config_error = _build_args(options, root)
+    if config_error:
+        print(config_error, file=sys.stderr)
+        return 1
     try:
         files = select_files(options)
     except GitStatusError as exc:
@@ -579,12 +687,12 @@ def run(argv: list[str] | None = None) -> int:
         return 0
     if not options.scan:
         _restore(root)
-    coverage = _prepare_coverage(options, root, files)
+    coverage = _prepare_coverage(options, root, files, gradle_args, maven_args)
     if coverage != 0:
         return coverage
     if options.scan:
         return _scan(options, root, files)
-    return _mutate_files(options, root, files)
+    return _mutate_files(options, root, files, gradle_args, maven_args)
 
 
 def main(argv: list[str] | None = None) -> None:

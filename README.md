@@ -1,8 +1,8 @@
 # mutator
 
-Mutation testing for Clojure, Java, Go, TypeScript, Rust, and Python. One run detects the language of each source file, applies that language's mutation rules, and writes the snapshot [uml-viewer](https://github.com/unclebob/uml-viewer) already reads.
+Mutation testing for Clojure, Java, Kotlin, Go, TypeScript, Rust, and Python. One run detects the language of each source file, applies that language's mutation rules, and writes the snapshot [uml-viewer](https://github.com/unclebob/uml-viewer) already reads.
 
-Clojure follows [clj-mutate](https://github.com/unclebob/clj-mutate). Go follows [mutate4go](https://github.com/unclebob/mutate4go). Java follows [mutate4java](https://github.com/unclebob/mutate4java). TypeScript, Rust, and Python use the same decisions as Java, spelled in that language. Function names and namespaces come from [crapper](https://github.com/unclebob/crapper), which is what uml-viewer joins to `.metrics/crap.edn`.
+Clojure follows [clj-mutate](https://github.com/unclebob/clj-mutate). Go follows [mutate4go](https://github.com/unclebob/mutate4go). Java follows [mutate4java](https://github.com/unclebob/mutate4java). TypeScript, Rust, Python, and Kotlin use the same decisions as Java, spelled in that language. Function names and namespaces come from [crapper](https://github.com/unclebob/crapper), which is what uml-viewer joins to `.metrics/crap.edn`.
 
 A mutant is killed when the tests fail or time out. It survives when the tests still pass. A site on a line the coverage report does not hit is uncovered and is not run. The score uml-viewer paints is killed / (killed + survived).
 
@@ -12,7 +12,7 @@ A mutant is killed when the tests fail or time out. It survives when the tests s
 ./mutator
 ```
 
-The first run creates `.venv` and installs the tool. crapper has to be checked out next to this directory (`../crapper`), because that is where the namespace and function names come from. From a project root the tool walks the tree, skips `test`, `spec`, `vendor`, `node_modules`, and `target`, and writes `.metrics/mutate/<namespace>.edn`.
+The first run creates `.venv` and installs the tool. crapper has to be checked out next to this directory (`../crapper`), because that is where the namespace and function names come from. Kotlin needs [ericeil/crapper](https://github.com/ericeil/crapper), which is the checkout that scores `.kt` files. From a project root the tool walks the tree, skips `test`, `spec`, `vendor`, `node_modules`, and `target`, and writes `.metrics/mutate/<namespace>.edn`.
 
 The first run of a tree executes every covered mutant. Start with the file you are working on.
 
@@ -25,6 +25,8 @@ The first run of a tree executes every covered mutant. Start with the file you a
 ./mutator --use-existing-coverage   # read reports already on disk
 ./mutator --test-command "pytest -q tests/test_demo.py"
 ./mutator --max-workers 3 src/demo/core.clj
+./mutator --gradle-arg=--tests com.example.BoardTest src/main/kotlin/demo/Board.kt
+./mutator --maven-arg=-Dtest=BoardTest src/main/kotlin/demo/Board.kt
 ```
 
 Once a snapshot exists, the next run is differential. It reruns survivors and every site in a function whose text changed. Killed mutants in an unchanged function stay killed. `--since-last-run` is that same selection. `--mutate-all` ignores it.
@@ -79,12 +81,13 @@ uml-viewer loads every `*.edn` file under `.metrics/mutate`. Each file is one na
 | --- | --- | --- |
 | Clojure | the `ns` | the `defn` / `defn-` name |
 | Java | `package.Class`, or `package.Outer.Inner` | the method name |
+| Kotlin | `package.Class`, `package.Outer.Inner`, or `package.FileKt` for a top-level function | the function name |
 | Go | the package import path, or `import/path.Receiver` | the function or method name |
 | TypeScript | the dotted module path, or `module.Class` | the function or method name |
 | Rust | `crate::module`, or `crate::module::Type` | the function or method name |
 | Python | the dotted module path, or `module.Class` | the function or method name |
 
-`defn-` is Clojure's private form. Elsewhere a private method, an unexported Go function, a Python name that starts with `_`, a Rust function that is not `pub`, or a TypeScript `private` / `#` name uses `defn-/`.
+`defn-` is Clojure's private form. Elsewhere a private method, a Kotlin `private` function, an unexported Go function, a Python name that starts with `_`, a Rust function that is not `pub`, or a TypeScript `private` / `#` name uses `defn-/`.
 
 ## What each language mutates
 
@@ -94,10 +97,13 @@ Tokens inside strings, comments, and quoted Clojure forms are left alone. A repl
 | --- | --- |
 | Clojure | clj-mutate's head symbols: `+`/`-`, `*` to `/`, `inc`/`dec`, comparisons, `=`/`not=`, `if`/`if-not`, `when`/`when-not`, `and`/`or`, and the seq, predicate, and coercion pairs. `true`/`false` and `0`/`1` anywhere. |
 | Java | `true`/`false`, `==`/`!=`, `<`/`<=`, `>`/`>=`, `+`/`-`, `*`/`/`, `&&`/`||`, delete `!` and unary `-`, `0`/`1`. Constructors are not entries, matching crapper. |
+| Kotlin | the Java set, plus `===`/`!==`, `?.` to `.`, delete `!!`, `?:` to the default or to `(left)!!`, `in`/`!in`, `is`/`!is`, `..`/`..<`, `until` to `..`, and `++`/`--`. Angle brackets in types are left alone. Constructors and `init` blocks are not entries, matching crapper. |
 | Go | mutate4go: `+`/`-`, `*` to `/` only, comparisons, `==`/`!=`, `true`/`false`, `&&`/`||`, `0`/`1`. |
 | TypeScript | the Java set, plus `===`/`!==`, `??` to `||`, and `?.` to `.`. A call or index drops `?.` (`a?.()` becomes `a()`). `.js`, `.jsx`, `.mjs`, and `.cjs` use these rules. |
 | Rust | the Java set (`&&`/`||`, `!`, unary `-`). |
 | Python | the Java set, spelled `and`/`or`, `not`, and `True`/`False`. |
+
+Kotlin is parsed with tree-sitter-kotlin from tree-sitter-language-pack. Before parsing, a context receiver (`context(Foo)` before a declaration, or a function type `context(Foo) () -> R`) is blanked with spaces of the same length. An escaped `\$` in a regular string is blanked the same way. A statement that starts with the identifier `where`, and `while (i < name.field)` when the grammar reads `<` as a type argument, are repaired only when that removes a parse error. The edits do not move newlines, so a site's line is the line in the file. A call named `context` is left alone.
 
 ## Tests and coverage
 
@@ -106,13 +112,14 @@ The baseline command has to pass before any mutant runs. A mutant's timeout is t
 | Language | Command | Where |
 | --- | --- | --- |
 | Clojure | `clj -M:spec --tag ~no-mutate` when Speclj is on the classpath, otherwise `clj -M:test` or `bb spec` | nearest `deps.edn` or `bb.edn` |
-| Java | `mvn -q test -DexcludeTags=no-mutate` | nearest `pom.xml` |
+| Java | `mvn -q test -DexcludeTags=no-mutate`, plus any `--maven-arg` | nearest `pom.xml` |
+| Kotlin | `gradlew test` when the nearest build file is Gradle's, otherwise the Java Maven command. `--gradle-arg` is placed after `test`. The wrapper is copied into each worker so Gradle compiles the mutant. | nearest `build.gradle` / `build.gradle.kts`, or `pom.xml` |
 | Go | `go test -count=1` of the file's package | nearest `go.mod` |
 | TypeScript | `npm test` | nearest `package.json` |
 | Rust | `cargo test` | nearest `Cargo.toml` |
 | Python | the project's `.venv` or `venv` Python running `pytest`, or `unittest discover` | nearest project file |
 
-Coverage is generated with crapper's commands unless `--use-existing-coverage` or `--no-coverage` is set. A file missing from the report is treated as uncovered, and the run says so.
+Coverage is generated with crapper's commands unless `--use-existing-coverage` or `--no-coverage` is set. Java and Kotlin read JaCoCo XML from Maven (`target/site/jacoco/jacoco.xml`), Gradle (`build/reports/jacoco/test/jacocoTestReport.xml`), and crapper's merged reports. `crapper.toml` keys `gradle-args` and `maven-args` are passed to that JaCoCo run, then `--gradle-arg` and `--maven-arg`. A file missing from the report is treated as uncovered, and the run says so.
 
 ## Development
 

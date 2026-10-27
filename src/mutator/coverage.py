@@ -1,12 +1,13 @@
 """Decide which lines the tests already exercise.
 
-Java uses JaCoCo source lines. Go uses statement profiles. Clojure prefers
-Cloverage's per-line form counts, then LCOV. The other languages use LCOV.
-A file that does not appear in a report has no coverage data.
+Java and Kotlin use JaCoCo source lines. Go uses statement profiles. Clojure
+prefers Cloverage's per-line form counts, then LCOV. The other languages use
+LCOV. A file that does not appear in a report has no coverage data.
 """
 
 from __future__ import annotations
 
+import os
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -128,11 +129,37 @@ def _covered_from_pairs(lines: dict[int, tuple[int, int]] | None) -> set[int] | 
     return {number for number, (covered, _total) in lines.items() if covered > 0}
 
 
+_JACOCO_WALK_SKIP = {".git", ".gradle", ".venv", "node_modules", "src", "venv"}
+
+
 def _jacoco_paths(root: Path) -> list[Path]:
-    paths = [root / "target" / "site" / "jacoco" / "jacoco.xml"]
-    paths.extend(root.glob("*/target/site/jacoco/jacoco.xml"))
-    paths.extend(root.glob("*/*/target/site/jacoco/jacoco.xml"))
-    return paths
+    """Maven and Gradle JaCoCo XML, including crapper's merged reports.
+
+    When the merged reports exist they replace per-module Gradle XML. Those
+    per-module reports miss classes executed by another project's tests.
+    """
+
+    maven: list[Path] = []
+    gradle: list[Path] = []
+    merged: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [
+            name for name in dirnames if name not in _JACOCO_WALK_SKIP and not name.startswith(".")
+        ]
+        current = Path(dirpath)
+        if current.name == "jacoco" and "jacoco.xml" in filenames:
+            maven.append(current / "jacoco.xml")
+        if (
+            current.name == "test"
+            and current.parent.name == "jacoco"
+            and "jacocoTestReport.xml" in filenames
+        ):
+            gradle.append(current / "jacocoTestReport.xml")
+        if current.name == "crapper" and current.parent.name == "jacoco":
+            merged.extend(current / name for name in filenames if name.endswith(".xml"))
+    if merged:
+        return sorted(merged) + sorted(maven)
+    return sorted(maven) + sorted(gradle)
 
 
 def _line_number(line) -> int | None:
@@ -190,7 +217,8 @@ def _jacoco_index(root: Path) -> dict[str, set[int]]:
         xml_root = _read_jacoco(path, crapper)
         if xml_root is None:
             continue
-        found.update(_package_lines(xml_root))
+        for key, lines in _package_lines(xml_root).items():
+            found.setdefault(key, set()).update(lines)
     return found
 
 
@@ -214,7 +242,7 @@ def covered_lines(root: Path, source_path: Path, language: str) -> set[int] | No
 
     crapper = ensure_crapper()
     path = source_path.resolve().as_posix()
-    if language == "java":
+    if language in {"java", "kotlin"}:
         return _lookup(_jacoco_index(root), path)
     bundle = crapper.coverage.load_bundle(root)
     if language == "go":
