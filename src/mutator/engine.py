@@ -219,10 +219,12 @@ def _apply_selected(
     baselines,
     outcomes,
     max_workers,
+    gradle_args,
+    maven_args,
 ) -> RunResult | None:
     if not selected:
         return None
-    command, cwd = test_plan(root, path, language, test_command)
+    command, cwd = test_plan(root, path, language, test_command, gradle_args, maven_args)
     cache_key = (_command_key(command), str(cwd))
     _remember_baseline(baselines, cache_key, runner, command, cwd)
     ok, seconds, tail = baselines[cache_key]
@@ -274,6 +276,8 @@ def mutate_file(
     mutation_warning: int,
     baselines: dict[tuple[tuple[str, ...], str], tuple[bool, float, str]],
     max_workers: int | None = None,
+    gradle_args: tuple[str, ...] | list[str] = (),
+    maven_args: tuple[str, ...] | list[str] = (),
 ) -> RunResult:
     """Mutate one file and write its namespaces into `.metrics/mutate`."""
 
@@ -309,6 +313,8 @@ def mutate_file(
         baselines,
         outcomes,
         max_workers,
+        gradle_args,
+        maven_args,
     )
     if failure is not None:
         return failure

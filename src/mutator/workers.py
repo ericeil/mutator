@@ -52,6 +52,8 @@ CONFIGS = (
     "build.gradle",
     "build.gradle.kts",
     "settings.gradle",
+    "settings.gradle.kts",
+    "gradle.properties",
     "go.mod",
     "go.sum",
     "package.json",
@@ -93,6 +95,25 @@ def symlink(link: Path, target: Path) -> None:
     link.symlink_to(target.resolve())
 
 
+# Gradle finds the project by resolving `gradlew`, including through a
+# symlink. A link would send the build back to the unmutated tree, so the
+# wrapper is a real file in the worker. The script itself is not mutated.
+_COPIED_FILES = frozenset({"gradlew", "gradlew.bat"})
+
+
+def place(link: Path, target: Path) -> None:
+    """Link `target`, or copy a Gradle wrapper so it stays inside the worker."""
+
+    if target.is_file() and target.name in _COPIED_FILES:
+        link.parent.mkdir(parents=True, exist_ok=True)
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.write_bytes(target.read_bytes())
+        link.chmod(target.stat().st_mode | 0o111)
+        return
+    symlink(link, target)
+
+
 def delete_tree(path: Path) -> None:
     """Remove a worker tree without following a link into the real project."""
 
@@ -128,7 +149,7 @@ def _link_children(worker_dir: Path, real_dir: Path, skip: set[str]) -> None:
         destination = worker_dir / child.name
         if destination.exists() or destination.is_symlink():
             continue
-        symlink(destination, child)
+        place(destination, child)
 
 
 # Node, and Vite in front of it, resolve a relative import from the real path
@@ -234,7 +255,7 @@ def _expand_directory(link: Path, real_dir: Path) -> None:
     for child in real_dir.iterdir():
         if child.name in SKIP_LINK:
             continue
-        symlink(link / child.name, child)
+        place(link / child.name, child)
 
 
 def _copy_importer(worker: Path, root: Path, relative: str) -> None:
