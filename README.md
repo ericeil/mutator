@@ -113,11 +113,13 @@ The baseline command has to pass before any mutant runs. A mutant's timeout is t
 | --- | --- | --- |
 | Clojure | `clj -M:spec --tag ~no-mutate` when Speclj is on the classpath, otherwise `clj -M:test` or `bb spec` | nearest `deps.edn` or `bb.edn` |
 | Java | `mvn -q test -DexcludeTags=no-mutate`, plus any `--maven-arg` | nearest `pom.xml` |
-| Kotlin | `gradlew test` when the nearest build file is Gradle's, otherwise the Java Maven command. `--gradle-arg` is placed after `test`. The wrapper is copied into each worker so Gradle compiles the mutant. | nearest `build.gradle` / `build.gradle.kts`, or `pom.xml` |
+| Kotlin | `gradlew test` for a single Gradle project. In a multi-project build, `gradlew :module:test` for the project that contains the file (the directory under `settings.gradle`, so `collect` is `:collect:test`). Otherwise the Java Maven command. `--gradle-arg` is placed after that task. The wrapper is copied into each worker so Gradle compiles the mutant. | nearest `build.gradle` / `build.gradle.kts`, or `pom.xml` |
 | Go | `go test -count=1` of the file's package | nearest `go.mod` |
 | TypeScript | `npm test` | nearest `package.json` |
 | Rust | `cargo test` | nearest `Cargo.toml` |
 | Python | the project's `.venv` or `venv` Python running `pytest`, or `unittest discover` | nearest project file |
+
+Unqualified `test` runs every project at or below the current directory. A `--tests` filter is then applied to each of those tasks, and a module with no matching test fails the baseline with "No tests found for given includes". Naming the project that contains the mutated file leaves sibling modules out of the run. A file in the root project of a multi-project build runs `:test`, which is only that project. A single-project build still runs `test`, and Maven is unchanged. A project whose directory does not follow the `include` path can be selected with `--test-command`.
 
 Coverage is generated with crapper's commands unless `--use-existing-coverage` or `--no-coverage` is set. Java and Kotlin read JaCoCo XML from Maven (`target/site/jacoco/jacoco.xml`), Gradle (`build/reports/jacoco/test/jacocoTestReport.xml`), and crapper's merged reports. `crapper.toml` keys `gradle-args` and `maven-args` are passed to that JaCoCo run, then `--gradle-arg` and `--maven-arg`. A file missing from the report is treated as uncovered, and the run says so.
 
