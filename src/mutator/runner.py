@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -205,6 +206,7 @@ def _java_plan(
 
 
 _GRADLE_BUILD_FILES = ("build.gradle", "build.gradle.kts")
+_GRADLE_SETTINGS_FILES = ("settings.gradle", "settings.gradle.kts")
 
 
 def nearest_any(start: Path, markers: tuple[str, ...], stop: Path) -> Path | None:
@@ -257,6 +259,133 @@ def _kotlin_tool(root: Path, source: Path) -> tuple[str, Path]:
     return "gradle", root
 
 
+def _settings_dir(start: Path, stop: Path) -> Path | None:
+    """The nearest Gradle settings directory at or above `start`, not above `stop`."""
+
+    current = start if start.is_dir() else start.parent
+    current = current.resolve()
+    stop = stop.resolve()
+    while True:
+        if any((current / name).is_file() for name in _GRADLE_SETTINGS_FILES):
+            return current
+        if current == stop or current.parent == current:
+            return None
+        current = current.parent
+
+
+def _settings_text(settings: Path) -> str:
+    for name in _GRADLE_SETTINGS_FILES:
+        path = settings / name
+        if path.is_file():
+            return _read(path)
+    return ""
+
+
+def _strip_gradle_comments(text: str) -> str:
+    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
+    return re.sub(r"(?m)//.*?$", "", text)
+
+
+def _include_body(text: str) -> str:
+    """Arguments of one `include` call, either `(...)` or the rest of the line."""
+
+    stripped = text.lstrip()
+    if not stripped.startswith("("):
+        return stripped.split("\n", 1)[0]
+    depth = 0
+    for index, char in enumerate(stripped):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return stripped[1:index]
+    return stripped
+
+
+def _included_projects(text: str) -> list[str]:
+    """Project paths named by `include` in a settings script.
+
+    `includeBuild` is a different call and is ignored. Comments are ignored.
+    """
+
+    cleaned = _strip_gradle_comments(text)
+    names: list[str] = []
+    for match in re.finditer(r"\binclude\b", cleaned):
+        body = _include_body(cleaned[match.end() :])
+        names.extend(re.findall(r"""["']([^"']+)["']""", body))
+    return names
+
+
+def _project_dirs(settings: Path) -> list[Path]:
+    """The root project and each included project, using Gradle's default directory."""
+
+    settings = settings.resolve()
+    directories = [settings]
+    for name in _included_projects(_settings_text(settings)):
+        parts = [part for part in name.split(":") if part not in ("", ".")]
+        if not parts or any(part == ".." for part in parts):
+            continue
+        candidate = (settings / Path(*parts)).resolve()
+        try:
+            candidate.relative_to(settings)
+        except ValueError:
+            continue
+        if candidate not in directories:
+            directories.append(candidate)
+    return directories
+
+
+def _owning_project(source: Path, projects: list[Path]) -> Path | None:
+    """The longest project directory that contains `source`."""
+
+    current = source if source.is_dir() else source.parent
+    current = current.resolve()
+    best: Path | None = None
+    best_len = -1
+    for project in projects:
+        try:
+            current.relative_to(project)
+        except ValueError:
+            continue
+        if len(project.parts) > best_len:
+            best = project
+            best_len = len(project.parts)
+    return best
+
+
+def _gradle_test_task(source: Path, module: Path, root: Path) -> str:
+    """The test task of the Gradle project that contains `source`.
+
+    Unqualified `test` runs in the current project and every project under it.
+    From the root of a multi-project build that is every module, and a
+    `--tests` filter then fails a module with no match ("No tests found for
+    given includes"). The task path names only the project that contains the
+    file. A single-project build stays `test`. A directory that has a build
+    file but is not included stays `test` too.
+    """
+
+    settings = _settings_dir(source, root)
+    if settings is None:
+        return "test"
+    settings = settings.resolve()
+    projects = _project_dirs(settings)
+    owning = _owning_project(source, projects)
+    if owning is None:
+        return "test"
+    module = module.resolve()
+    # A build file that the settings script does not include is not that
+    # project. Keep the unqualified task, which is what this directory ran before.
+    if module != owning and module != settings:
+        return "test"
+    if owning == settings:
+        if len(projects) > 1:
+            return ":test"
+        return "test"
+    relative = owning.relative_to(settings)
+    return ":" + ":".join(relative.parts) + ":test"
+
+
 def _kotlin_plan(
     root: Path,
     source: Path,
@@ -266,9 +395,10 @@ def _kotlin_plan(
     tool, directory = _kotlin_tool(root, source)
     if tool == "maven":
         return ["mvn", "-q", "test", "-DexcludeTags=no-mutate", *maven_args], directory
-    # Args sit after `test`, so `--tests` is a task option. `-D` and `-P`
+    # Args sit after the task, so `--tests` is a task option. `-D` and `-P`
     # apply from either position.
-    return [_gradle_program(directory, root), "test", *gradle_args], directory
+    task = _gradle_test_task(source, directory, root)
+    return [_gradle_program(directory, root), task, *gradle_args], directory
 
 
 def _go_plan(root: Path, source: Path) -> tuple[Command, Path]:

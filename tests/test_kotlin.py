@@ -233,6 +233,110 @@ def test_gradle_and_maven_commands(tmp_path):
     assert directory == loose.resolve()
 
 
+def _gradle_wrapper(directory: Path) -> None:
+    wrapper = directory / "gradlew"
+    wrapper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+
+
+def _kotlin_file(root: Path, relative: str) -> Path:
+    source = root / relative
+    source.parent.mkdir(parents=True)
+    source.write_text("package demo\nfun place(x: Int) = x > 0\n", encoding="utf-8")
+    return source
+
+
+def test_multi_module_gradle_runs_only_the_owning_projects_test_task(tmp_path):
+    root = tmp_path / "proj"
+    collect = _kotlin_file(root, "collect/src/main/kotlin/demo/Board.kt")
+    sibling = _kotlin_file(root, "detekt-treapability/src/main/kotlin/demo/Rule.kt")
+    (root / "collect" / "build.gradle.kts").write_text("plugins { kotlin(\"jvm\") }\n", encoding="utf-8")
+    (root / "detekt-treapability" / "build.gradle.kts").write_text("", encoding="utf-8")
+    (root / "build.gradle.kts").write_text("", encoding="utf-8")
+    (root / "settings.gradle.kts").write_text(
+        "\n".join(
+            [
+                'rootProject.name = "Collections"',
+                "// include(\"skip\")",
+                'includeBuild("build-logic")',
+                'include("collect", "detekt-treapability", "benchmarks")',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    _gradle_wrapper(root)
+
+    command, directory = plan_command(root, collect, "kotlin", None, ["--tests", "demo.BoardTest"])
+    assert command == ["../gradlew", ":collect:test", "--tests", "demo.BoardTest"]
+    assert directory == root / "collect"
+    assert ":detekt-treapability" not in command
+
+    command, directory = plan_command(
+        root, sibling, "kotlin", None, ["-DJacoco", "--tests", "demo.RuleTest"]
+    )
+    assert command == ["../gradlew", ":detekt-treapability:test", "-DJacoco", "--tests", "demo.RuleTest"]
+    assert directory == root / "detekt-treapability"
+
+    root_source = _kotlin_file(root, "src/main/kotlin/demo/Root.kt")
+    command, directory = plan_command(root, root_source, "kotlin", None, ["--tests", "demo.RootTest"])
+    assert command == ["./gradlew", ":test", "--tests", "demo.RootTest"]
+    assert directory == root.resolve()
+
+    override, override_dir = plan_command(root, collect, "kotlin", "./gradlew :collect:test --tests demo.BoardTest")
+    assert override == "./gradlew :collect:test --tests demo.BoardTest"
+    assert override_dir == root.resolve()
+
+
+def test_gradle_include_paths_name_the_task_when_a_module_has_no_build_file(tmp_path):
+    root = tmp_path / "proj"
+    source = _kotlin_file(root, "services/web/src/main/kotlin/demo/Board.kt")
+    (root / "build.gradle").write_text("subprojects { apply plugin: 'java' }\n", encoding="utf-8")
+    (root / "settings.gradle").write_text(
+        "\n".join(
+            [
+                "include 'services:web'",
+                "include(",
+                '    "collect"',
+                ")",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    _gradle_wrapper(root)
+
+    command, directory = plan_command(root, source, "kotlin", None, ["--tests", "demo.BoardTest"])
+    assert command == ["./gradlew", ":services:web:test", "--tests", "demo.BoardTest"]
+    assert directory == root.resolve()
+
+    # A build file that the settings script does not include keeps `test`.
+    example = _kotlin_file(root, "examples/src/main/kotlin/demo/Sample.kt")
+    (root / "examples" / "build.gradle.kts").write_text("", encoding="utf-8")
+    command, directory = plan_command(root, example, "kotlin", None)
+    assert command == ["../gradlew", "test"]
+    assert directory == root / "examples"
+
+
+def test_a_single_gradle_project_with_settings_still_runs_test(tmp_path):
+    root = tmp_path / "proj"
+    source = _kotlin_file(root, "src/main/kotlin/demo/Board.kt")
+    (root / "build.gradle.kts").write_text("", encoding="utf-8")
+    (root / "settings.gradle.kts").write_text('rootProject.name = "demo"\n', encoding="utf-8")
+    _gradle_wrapper(root)
+
+    command, directory = plan_command(root, source, "kotlin", None, ["--tests", "demo.BoardTest"])
+    assert command == ["./gradlew", "test", "--tests", "demo.BoardTest"]
+    assert directory == root.resolve()
+
+    java = root / "src" / "demo" / "Board.java"
+    java.parent.mkdir(parents=True, exist_ok=True)
+    java.write_text("package demo;\nclass Board {}\n", encoding="utf-8")
+    (root / "pom.xml").write_text("<project/>\n", encoding="utf-8")
+    command, _directory = plan_command(root, java, "java", None, maven_args=["-Dtest=BoardTest"])
+    assert command == ["mvn", "-q", "test", "-DexcludeTags=no-mutate", "-Dtest=BoardTest"]
+
+
 def test_a_worker_copies_the_gradle_wrapper(tmp_path):
     root = tmp_path / "proj"
     source = root / "src" / "main" / "kotlin" / "demo" / "Board.kt"
@@ -358,3 +462,69 @@ def test_gradle_mutants_run_through_the_copied_wrapper(tmp_path, capsys):
     assert "SURVIVED" in captured.out
     assert source.read_text(encoding="utf-8").startswith("package demo")
     assert os.access(script, os.X_OK)
+
+
+def test_a_multi_module_run_asks_gradle_for_that_modules_test_task(tmp_path, capsys):
+    root = tmp_path / "proj"
+    source = root / "collect" / "src" / "main" / "kotlin" / "demo" / "Math.kt"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "package demo\n"
+        "fun add(a: Int, b: Int): Int {\n"
+        "    if (a > 0) return a + b\n"
+        "    return 0\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (root / "collect" / "build.gradle.kts").write_text("", encoding="utf-8")
+    (root / "detekt-treapability" / "build.gradle.kts").parent.mkdir(parents=True)
+    (root / "detekt-treapability" / "build.gradle.kts").write_text("", encoding="utf-8")
+    (root / "build.gradle.kts").write_text("", encoding="utf-8")
+    (root / "settings.gradle.kts").write_text(
+        'include("collect", "detekt-treapability")\n',
+        encoding="utf-8",
+    )
+    log = tmp_path / "gradle-args"
+    script = root / "gradlew"
+    script.write_text(
+        "#!/bin/sh\n"
+        f"echo \"$@\" >> {log}\n"
+        "found=\n"
+        "bad=\n"
+        "for arg in \"$@\"; do\n"
+        "  case \"$arg\" in\n"
+        "    :collect:test) found=1 ;;\n"
+        "    test|:test|:detekt-treapability:test) bad=1 ;;\n"
+        "  esac\n"
+        "done\n"
+        "if [ -n \"$bad\" ] || [ -z \"$found\" ]; then\n"
+        "  echo \"bad gradle task: $*\" >&2\n"
+        "  exit 1\n"
+        "fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    code = run(
+        [
+            "--no-coverage",
+            "--mutate-all",
+            "--max-workers",
+            "1",
+            "--lines",
+            "3",
+            "--root",
+            str(root),
+            "--gradle-arg=--tests=demo.MathTest",
+            "collect/src/main/kotlin/demo/Math.kt",
+        ]
+    )
+    captured = capsys.readouterr()
+    recorded = log.read_text(encoding="utf-8")
+    assert code == 3
+    assert "Baseline failed" not in captured.err
+    assert "bad gradle task" not in captured.err
+    assert ":collect:test" in recorded
+    assert "--tests=demo.MathTest" in recorded
+    assert ":detekt-treapability:test" not in recorded
+    assert source.read_text(encoding="utf-8").startswith("package demo")

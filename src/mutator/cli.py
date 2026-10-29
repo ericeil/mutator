@@ -92,8 +92,10 @@ Options:
                                 and for the Gradle JaCoCo coverage run. Repeat
                                 for more than one. A value may start with '-',
                                 as in --gradle-arg=--tests or
-                                --gradle-arg=-DJacoco. Placed after `test`, so
-                                `--tests` reaches the test task.
+                                --gradle-arg=-DJacoco. Placed after the test
+                                task. A multi-project build runs the module
+                                that contains the file (`:collect:test`), so
+                                `--tests` is not applied to sibling modules.
   --maven-arg <arg>             Extra argument for a Java or Kotlin Maven test
                                 run, and for the Maven JaCoCo coverage run.
                                 Repeat for more than one.
