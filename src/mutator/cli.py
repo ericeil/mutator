@@ -496,10 +496,13 @@ def _combine_build_args(
     return gradle, maven
 
 
-def _build_args(options: Options, root: Path) -> tuple[list[str], list[str], str | None]:
+def _build_args(
+    options: Options, root: Path
+) -> tuple[list[str], list[str], str | None, str | None]:
     """Command-line build args, after the ones in crapper.toml.
 
     The third value is an error message when crapper.toml cannot be read.
+    The fourth is the JaCoCo version from that file, when crapper reports one.
     A crapper checkout without that module contributes no file arguments.
     """
 
@@ -507,13 +510,14 @@ def _build_args(options: Options, root: Path) -> tuple[list[str], list[str], str
         from crapper.config import ConfigError, build_tool_args
     except ImportError:
         gradle, maven = _combine_build_args(options, [], [])
-        return gradle, maven, None
+        return gradle, maven, None, None
     try:
-        configured_gradle, configured_maven = build_tool_args(root)
+        configured = build_tool_args(root)
     except ConfigError as exc:
-        return [], [], str(exc)
-    gradle, maven = _combine_build_args(options, configured_gradle, configured_maven)
-    return gradle, maven, None
+        return [], [], str(exc), None
+    jacoco_version = configured[2] if len(configured) > 2 else None
+    gradle, maven = _combine_build_args(options, list(configured[0]), list(configured[1]))
+    return gradle, maven, None, jacoco_version
 
 
 def _prepare_coverage(
@@ -522,6 +526,7 @@ def _prepare_coverage(
     files: list[Path],
     gradle_args: list[str] | None = None,
     maven_args: list[str] | None = None,
+    jacoco_version: str | None = None,
 ) -> int:
     """Run coverage generation. A failed command's code is returned as-is.
 
@@ -550,6 +555,7 @@ def _prepare_coverage(
         None,
         gradle_args=gradle_args or [],
         maven_args=maven_args or [],
+        jacoco_version=jacoco_version,
     )
     if isinstance(code, int) and code != 0:
         return code
@@ -675,7 +681,7 @@ def run(argv: list[str] | None = None) -> int:
         print(missing, file=sys.stderr)
         return 2
     root = options.project_root.resolve()
-    gradle_args, maven_args, config_error = _build_args(options, root)
+    gradle_args, maven_args, config_error, jacoco_version = _build_args(options, root)
     if config_error:
         print(config_error, file=sys.stderr)
         return 1
@@ -689,7 +695,9 @@ def run(argv: list[str] | None = None) -> int:
         return 0
     if not options.scan:
         _restore(root)
-    coverage = _prepare_coverage(options, root, files, gradle_args, maven_args)
+    coverage = _prepare_coverage(
+        options, root, files, gradle_args, maven_args, jacoco_version
+    )
     if coverage != 0:
         return coverage
     if options.scan:

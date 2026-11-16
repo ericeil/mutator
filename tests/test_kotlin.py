@@ -177,7 +177,10 @@ fun shift(by: Int) = when {
     assert len(prepared) == len(source)
     assert prepared.count("\n") == source.count("\n")
     assert "where T : Any" in prepared
-    assert ";where.mapIndexedNotNull" in prepared
+    # A `where.foo` call the grammar already accepts is left alone. The
+    # semicolon is only inserted when that line is a parse error.
+    assert "where.mapIndexedNotNull" in prepared
+    assert ";where.mapIndexedNotNull" not in prepared
     assert "i<(out).size" in prepared
     assert "by < 0 ->" in prepared
     assert "\\$" not in prepared
@@ -410,15 +413,25 @@ def test_build_args_follow_crapper_toml_and_the_command_line(tmp_path):
         'gradle-args = ["--tests", "from.file"]\nmaven-args = ["-Dfile=1"]\n',
         encoding="utf-8",
     )
-    gradle, maven, error = _build_args(options, tmp_path)
+    gradle, maven, error, jacoco_version = _build_args(options, tmp_path)
     assert error is None
+    assert jacoco_version is None
     assert gradle == ["--tests", "from.file", "-DJacoco", "--tests"]
     assert maven == ["-Dfile=1", "-Dtest=BoardTest"]
+
+    (tmp_path / "crapper.toml").write_text(
+        'gradle-args = ["--tests", "from.file"]\n'
+        'maven-args = ["-Dfile=1"]\n'
+        'jacoco-version = "0.8.12"\n',
+        encoding="utf-8",
+    )
+    _gradle, _maven, _error, jacoco_version = _build_args(options, tmp_path)
+    assert jacoco_version == "0.8.12"
 
     broken = tmp_path / "broken"
     broken.mkdir()
     (broken / "crapper.toml").write_text("gradle-args = 1\n", encoding="utf-8")
-    _gradle, _maven, error = _build_args(parse_args([]), broken)
+    _gradle, _maven, error, _jacoco_version = _build_args(parse_args([]), broken)
     assert error
     assert "gradle-args" in error
 
